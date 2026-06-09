@@ -3,11 +3,11 @@
 <p align="center"><i>Autonomous coding agent that builds applications from natural language —<br/>sandboxed, audited, goal-tracking, and self-reviewing by design.</i></p>
 
 <p align="center">
+  <a href="https://github.com/T11g1/dom/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/T11g1/dom/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <img alt="Node 22+" src="https://img.shields.io/badge/node-22+-339933?logo=node.js&logoColor=white">
   <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-6-3178C6?logo=typescript&logoColor=white">
   <img alt="Docker" src="https://img.shields.io/badge/Docker-sandboxed-2496ED?logo=docker&logoColor=white">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-82%20passing-brightgreen">
 </p>
 
 ---
