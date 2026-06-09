@@ -1,0 +1,30 @@
+# dependencies / build
+node_modules/
+dist/
+*.tsbuildinfo
+
+# secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# TLS material — if you put cert/key in the repo root, you're doing it wrong
+*.pem
+*.key
+
+# Dom-generated state (per-host, never committed)
+.dom-claude/
+.dom-brain/
+.dom-goal
+.dom-goal.json
+logs/
+
+# Generated user projects — keep the folder, ignore contents
+projects/*
+!projects/.gitkeep
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
