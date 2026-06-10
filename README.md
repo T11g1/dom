@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.png" alt="Dom" width="800">
+</p>
+
 <h1 align="center">Dom</h1>
 
 <p align="center"><i>Autonomous coding agent that builds applications from natural language —<br/>sandboxed, audited, goal-tracking, and self-reviewing by design.</i></p>
