@@ -56,10 +56,10 @@ haproxy/haproxy.cfg       HAProxy SNI allowlist config
 Three SDK hooks enforce safety. All state is **session-scoped** (keyed by SDK-provided `session_id`) so two simultaneous runs in the same host process cannot corrupt each other's tracking.
 
 **PreToolUse — blocks before execution:**
-- Destructive commands: `rm -rf /`, `rm -rf ~`, `git push main`, `git push --force`, `DROP TABLE`, `mkfs`, `dd`, fork bombs, nested-shell wrappers, `$(...)` and backtick wrappers.
-- Bash network: only package registries + GitHub allowed. Unknown hosts blocked.
+- Destructive commands: catastrophic `rm` (token-aware — `rm -rf /`, `rm -fr /`, `rm -r -f /`, `rm --recursive --force /`, `rm -rf /*`, `~`, `.`, `./` are all caught regardless of flag order/long-form), `git push main`, `git push --force`, `DROP TABLE`, `mkfs`, `dd`, fork bombs, nested-shell wrappers, `$(...)` and backtick wrappers.
+- Bash network: only package registries + GitHub allowed. **Every** host in a (possibly chained) command is checked — `curl ok.com && curl evil.com` no longer slips through on the first host. Hosts are lowercased before comparison. **Fails closed:** a recognized network tool (curl/wget/nc/ssh/...) whose target can't be parsed (URL in a variable/file/flag, listening socket) is blocked rather than allowed.
 - **WebFetch host allowlist:** same allowlist as Bash. WebFetch is no longer a free egress channel — `WebFetch` to an unlisted host returns a deny reason.
-- Filesystem path block: writes to `/etc`, `/usr`, `/bin`, `.ssh`, `.bashrc`, `.zshrc`, `.gitconfig`.
+- Filesystem path block: writes to `/etc`, `/usr`, `/bin`, `/sbin`, `/root`, `/var`, `/opt`, `/lib`, `/boot`, `.ssh`, `.bashrc`, `.zshrc`, `.gitconfig`. The path is `path.resolve()`d **before** matching, so `..` traversal and trailing-slash-less targets (`/root`) can't dodge the block.
 - **Write/Edit content leak detection:** the file content (or Edit's `new_string`) is scanned by `leak-detect.ts`. Any match (API keys, Authorization headers, DB connection strings with creds, PEM private keys, generic `secret=…` assignments ≥16 chars) is blocked with a deny reason naming the matched pattern.
 
 **PostToolUse — tracks per-session state:**
@@ -86,10 +86,18 @@ All routes except `/health` require `Authorization: Bearer <AGENT_API_TOKEN>` he
 
 `POST /agent` is rate-limited per IP (sliding window, AGENT_RATE_LIMIT requests/minute). When exceeded: `429 { "error": "Rate limited. Try again in N seconds." }` with `Retry-After` header.
 
+**Request body size cap** — POST /agent buffers at most `AGENT_MAX_BODY_BYTES` (default 1 MB); a larger body gets `413` and the connection is destroyed *before* buffering, so a huge/`/dev/zero` POST can't exhaust memory. The prompt-length check runs after, on the parsed JSON.
+
 **POST /agent input validation** — body must be JSON with:
 - `prompt` (required, string, non-empty after trim, ≤ 100,000 chars; null bytes are stripped before length check)
 - `sessionId` (optional, string matching `^[A-Za-z0-9-]+$`, ≤ 128 chars)
 - `outputDir` (optional, string, must not contain `..` or start with `/`)
+
+**GET /sessions/:id** validates the path segment with the **same** `^[A-Za-z0-9-]+$` rule before the lookup — `url.pathname` is percent-decoded, so an unvalidated param (`..%2f..%2fetc`) could otherwise reach the filesystem-backed SDK call. Invalid ids get `400`.
+
+**Error responses** never reflect raw `err.message` to clients (avoids leaking host paths / internal IDs): `/sessions` 500s and the SSE `error` event return a generic message and log the detail server-side. Intentional structured errors (validation `400`, budget `402`/`budget_exceeded`) keep their specific fields.
+
+**Rate-limit identity** — keyed on `req.socket.remoteAddress` by default. Set `AGENT_TRUST_PROXY=true` only behind a trusted reverse proxy to key on the rightmost `X-Forwarded-For` hop. The bucket map is bounded (`AGENT_RATE_LIMIT_MAX_IPS`) so a source-rotating flood can't grow it without limit.
 
 Validation failures return `400 { "error": "<specific message>" }` and are recorded in the audit log as a `http_validation` event with metadata only (never the prompt content).
 
@@ -201,11 +209,16 @@ Dom has a long-lived markdown memory bank at `./.dom-brain/` (override with `AGE
 | AGENT_BRAIN_DIR | ./.dom-brain | Directory holding the markdown memory bank. See "Shared brain". |
 | AGENT_BRAIN_MAX_LOADED | 30 | Soft cap on memories loaded into the system prompt per run (newest by `last_used` first). |
 | AGENT_BRAIN_MAX_ENTRIES | 100 | Hard cap on total memories on disk. Curator must evict before adding when at cap. |
-| AGENT_SESSION_ENCRYPT | false | When `true`, session files at rest are AES-256-GCM encrypted (bracket mode: plaintext only during active runs). Key derived from AGENT_API_TOKEN via PBKDF2. |
+| AGENT_SESSION_ENCRYPT | false | When `true`, session files at rest are AES-256-GCM encrypted (bracket mode: plaintext only during active runs). Key derived from AGENT_API_TOKEN via PBKDF2→HKDF. |
+| AGENT_SESSION_ENCRYPT_MIGRATE | false | One-time opt-in. When `true`, plaintext session files are accepted (and sealed on the next encrypt). When `false` (default) with encryption on, plaintext at rest is treated as a downgrade/tamper and **rejected** — independent of the seal marker. Set it once to migrate a pre-existing plaintext directory, then unset. |
 | AGENT_TLS_CERT | (empty) | Path to a PEM-encoded TLS certificate. Set BOTH cert+key to serve HTTPS; leave BOTH empty for HTTP. Server exits if only one is set. |
 | AGENT_TLS_KEY | (empty) | Path to a PEM-encoded TLS private key. See AGENT_TLS_CERT. |
 | CLAUDE_CONFIG_DIR | ./.dom-claude | Where the SDK stores sessions. Default keeps them inside the project (not in ~/.claude/). Only override if you need the SDK's default location. |
 | ALLOWED_HOSTS | (empty) | Extra allowed network hosts (comma-separated) |
+| AGENT_EGRESS_PROXY | (empty) | When set (e.g. `http://dom-egress-proxy:8443`), injects `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` into the sandbox container so proxy-aware clients route through the SNI allowlist. Opt-in; raw sockets/DNS still bypass it. See "Network Security". |
+| AGENT_TRUST_PROXY | false | When `true`, the rate limiter reads the rightmost `X-Forwarded-For` hop as the client IP (use only behind a trusted reverse proxy). Default uses the raw socket address. |
+| AGENT_MAX_BODY_BYTES | 1000000 | Hard cap on POST /agent request body size (bytes). Oversized requests get `413` and the connection is torn down before buffering — prevents memory-exhaustion DoS. |
+| AGENT_RATE_LIMIT_MAX_IPS | 10000 | Max distinct IPs tracked by the rate limiter. Oldest entries are evicted at the cap so a source-rotating flood can't grow the map unbounded. |
 
 ## Network Security (defense in depth)
 
@@ -217,9 +230,11 @@ Egress filtering uses three independent layers. Higher layers should not be reli
 | 2. Docker network | `dom-sandbox-net` (auto-created by `runInSandbox`) | Container isolation: the agent container can't reach other Docker networks/containers on the host | Public internet egress — by itself, the bridge network does NOT filter outbound to the internet |
 | 3. HAProxy egress proxy | `docker-compose.egress.yml` + `haproxy/haproxy.cfg` | TLS SNI allowlist on outbound HTTPS. Containers with HTTPS_PROXY pointed at the proxy can ONLY reach allowed hostnames | HTTP (non-TLS), DNS, raw TCP — only HTTPS via SNI is filtered |
 
-**Default mode** (just `npm run dev`): layers 1 + 2 are active. Container has internet access, but the agent's tool calls go through Bash guardrails first.
+**Default mode** (just `npm run dev`): layers 1 + 2 are active. **The container has FULL internet egress** — the bridge network isolates containers from each other but does NOT filter outbound traffic to the internet. Layer 1 (the Bash host-allowlist) is the only egress filter in this mode, and it is best-effort defense-in-depth: it now checks *every* host in a chained command (not just the first), but it is still bypassable by anything that doesn't go through the Bash tool's parseable surface — raw sockets (`/dev/tcp`), DNS, non-allowlisted binaries, or a buggy SDK. **Do not treat default mode as network-contained.**
 
-**Production mode**: bring up the egress proxy with `docker-compose -f docker-compose.egress.yml up -d`. Then add `HTTPS_PROXY=http://dom-egress-proxy:8443` to the agent container's env so all HTTPS goes through the SNI allowlist. Edit `haproxy/haproxy.cfg` to change the allowed hostnames.
+**Production mode**: bring up the egress proxy with `docker-compose -f docker-compose.egress.yml up -d`, then set `AGENT_EGRESS_PROXY=http://dom-egress-proxy:8443` on the host — `sandbox.ts` injects `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` into the container so proxy-aware HTTPS goes through the SNI allowlist. Edit `haproxy/haproxy.cfg` to change the allowed hostnames.
+
+> ⚠️ **The egress proxy is NOT a verified hard boundary yet.** `haproxy/haproxy.cfg`'s backend is a placeholder (`server target 0.0.0.0:443` does not dynamically route by SNI, and `HTTPS_PROXY` clients speak HTTP CONNECT, which the current tcp/SNI frontend does not handle). It needs a rework (resolver + `do-resolve`/`set-dst`, or a CONNECT-aware frontend) and validation against a live container before you can rely on it. Even once working, `HTTPS_PROXY` only constrains proxy-aware clients — raw sockets and DNS bypass it; a true hard boundary needs an `internal` network where the proxy is the only route out.
 
 The Docker network is created on first sandbox run and removed on process exit (best-effort — fails silently if other containers are still attached). If network creation fails, sandbox falls back to Docker's default bridge with a warning printed.
 
@@ -280,11 +295,15 @@ Sessions may contain sensitive prompts and generated code. When `AGENT_SESSION_E
 
 **Why bracket and not per-write?** The SDK owns its session file I/O directly — it does not expose a pluggable storage hook. True encrypt-on-every-write would require monkey-patching `fs`, which is fragile. Bracket encryption limits the plaintext window to when the agent is actively running — the same window during which the data is in memory anyway.
 
-**Key management:** the encryption key is derived from `AGENT_API_TOKEN` via PBKDF2-SHA256 (200k iterations, random 16-byte salt per file, 32-byte key). No additional secret is needed. If `AGENT_API_TOKEN` changes, existing encrypted sessions become unreadable.
+**Key management:** the encryption key is derived from `AGENT_API_TOKEN` via PBKDF2-SHA256 (200k iterations, random 16-byte salt per file, 32-byte key), **then HKDF-Expand'd with a fixed domain label** (`dom-session-encryption-v2`). The PBKDF2 stretch is unchanged; the extra HKDF step cryptographically separates the at-rest key from the raw bearer token (and its other uses), so leaking `AGENT_API_TOKEN` does not directly yield the encryption key. No additional secret is needed. If `AGENT_API_TOKEN` changes, existing encrypted sessions become unreadable.
 
-**File format (binary):** `DOMENC1` magic (7 bytes) | salt (16) | iv (12) | GCM auth tag (16) | ciphertext.
+**File format (binary):** `DOMENC2` magic (7 bytes) | salt (16) | iv (12) | GCM auth tag (16) | ciphertext. Legacy `DOMENC1` (PBKDF2 key used directly, no HKDF) is still **readable** for backward compatibility; new writes are always `DOMENC2`.
 
-**Graceful fallback:** existing unencrypted session files are still readable — the decrypt path checks the magic header and passes plaintext through untouched. You can enable encryption on a directory that already has plaintext sessions; they'll get sealed on the next run.
+**Downgrade / tamper detection (fail-closed):** with encryption enabled, a plaintext file at rest under the sessions root is treated as a downgrade/tamper signal (an attacker swapping ciphertext→plaintext, or a crash that left the tree unsealed): `readSessionFile` **throws**, and the decrypt sweep logs a loud `SECURITY:` warning and counts it as an error rather than silently ingesting it. This is **independent of the seal marker** — deleting `.dom-enc-marker` does NOT re-open silent acceptance. The only way to legitimately accept plaintext at rest is the explicit one-time `AGENT_SESSION_ENCRYPT_MIGRATE=true` opt-in (used when first enabling encryption on a directory that already holds plaintext sessions). The HMAC seal marker (`.dom-enc-marker`) is still written after a clean sweep as a positive "sealed" record. (A full per-file signed manifest remains the complete defense-in-depth follow-up; this closes the silent-acceptance and marker-deletion cases.)
+
+**Concurrent runs (reference counting):** the decrypt→run→re-encrypt bracket is reference-counted (`beginActiveRun`/`endActiveRun`). The tree is decrypted on the first concurrent entrant and only re-encrypted when the **last** run/listing exits, so one run's `finally` can't re-seal files another run is still reading. Re-encryption errors are surfaced (logged), not swallowed.
+
+**Graceful fallback:** existing unencrypted session files are still readable when no seal marker exists yet — the decrypt path checks the magic header and passes plaintext through. You can enable encryption on a directory that already has plaintext sessions; they get sealed (and the marker written) on the next run. Once sealed, the downgrade detection above applies.
 
 **Session location:** Dom sets `CLAUDE_CONFIG_DIR=./.dom-claude` by default so sessions are stored inside the project, not in `~/.claude/`. This keeps encryption sweeps bounded to the project folder. `.dom-claude/` is in `.gitignore`.
 
@@ -293,6 +312,7 @@ Sessions may contain sensitive prompts and generated code. When `AGENT_SESSION_E
 ## Security Notes
 
 - Never commit .env — it contains secrets (API key, auth token). It's in .gitignore.
+- The sandbox container runs **non-root as the host UID** (`--user`), `--cap-drop ALL` with only `CHOWN`/`FOWNER` re-added (no `SETUID`/`SETGID`/`DAC_OVERRIDE`), `no-new-privileges`, and `--pids-limit 512`. Running as the host UID also makes bind-mounted `/workspace` and `/brain` writes work without permission-bypass caps.
 - The guardrails regex patterns are defense-in-depth, not a substitute for Docker isolation. Always run with AGENT_SANDBOX=true in production.
 - HTTP API requires bearer token (AGENT_API_TOKEN). Token is compared with timing-safe equality. Server refuses to start if unset.
 - POST /agent is rate-limited per IP (AGENT_RATE_LIMIT/min, sliding window). 429 + Retry-After when exceeded.

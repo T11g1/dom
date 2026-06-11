@@ -6,8 +6,8 @@ import type { SessionInfo } from "./types.js";
 import {
   ensureClaudeConfigDir,
   isEncryptionEnabled,
-  decryptSessionsNow,
-  encryptSessionsNow,
+  beginActiveRun,
+  endActiveRun,
 } from "./session-crypt.js";
 
 // Ensure SDK reads/writes into the project-local ./.dom-claude/ dir.
@@ -20,11 +20,14 @@ ensureClaudeConfigDir();
  */
 async function withDecryptedSessions<T>(fn: () => Promise<T>): Promise<T> {
   if (!isEncryptionEnabled()) return fn();
-  decryptSessionsNow();
+  // Share the run-level reference count so a listing during an active run
+  // doesn't prematurely re-encrypt the tree out from under it. Re-encryption
+  // failures are surfaced (not swallowed) by endActiveRun.
+  beginActiveRun();
   try {
     return await fn();
   } finally {
-    try { encryptSessionsNow(); } catch { /* swallow — data still readable next call */ }
+    endActiveRun();
   }
 }
 
