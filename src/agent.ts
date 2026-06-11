@@ -8,9 +8,8 @@ import { ensureBrainDir } from "./brain.js";
 import { runInSandbox, isSandboxEnabled } from "./sandbox.js";
 import {
   ensureClaudeConfigDir,
-  isEncryptionEnabled,
-  decryptSessionsNow,
-  encryptSessionsNow,
+  beginActiveRun,
+  endActiveRun,
 } from "./session-crypt.js";
 import { writeGoal, clearGoal } from "./goal.js";
 import { addRunCost, isOverBudget, getMaxCostUsd } from "./budget.js";
@@ -97,10 +96,12 @@ function buildLocalQuery(request: AgentRequest): Query {
  */
 function createLocalAgent(request: AgentRequest): Query {
   const outputDir = request.outputDir || process.env.AGENT_OUTPUT_DIR || process.cwd();
-  const encryptionOn = isEncryptionEnabled();
 
-  // Decrypt BEFORE the SDK starts reading (listSessions, resume, etc.)
-  if (encryptionOn) decryptSessionsNow();
+  // Enter the decrypted bracket BEFORE the SDK starts reading (listSessions,
+  // resume, etc.). Reference-counted: the tree is only re-encrypted when the
+  // last concurrent run/listing exits, so we never re-seal files another run
+  // is still reading. No-op when encryption is disabled.
+  beginActiveRun();
 
   const inner = buildLocalQuery(request);
 
@@ -113,9 +114,7 @@ function createLocalAgent(request: AgentRequest): Query {
       }
     } finally {
       clearGoal(outputDir);
-      if (encryptionOn) {
-        try { encryptSessionsNow(); } catch { /* don't let crypto break the run result */ }
-      }
+      endActiveRun();
     }
   }
 

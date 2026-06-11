@@ -24,6 +24,8 @@
 import {
   createCipheriv,
   createDecipheriv,
+  createHmac,
+  hkdfSync,
   pbkdf2Sync,
   randomBytes,
 } from "crypto";
@@ -43,8 +45,14 @@ import { join, resolve, dirname } from "path";
 // Config
 // ---------------------------------------------------------------------------
 
-const MAGIC = Buffer.from("DOMENC1", "utf-8");
-const MAGIC_LEN = MAGIC.length;
+// V1 = legacy (PBKDF2 key used directly). V2 = current (PBKDF2 stretch then
+// HKDF-Expand with a domain label, so the at-rest key is cryptographically
+// separated from the raw AGENT_API_TOKEN / its other uses). Both magics are
+// the same length; V1 is still readable for backward compatibility.
+const MAGIC_V1 = Buffer.from("DOMENC1", "utf-8");
+const MAGIC_V2 = Buffer.from("DOMENC2", "utf-8");
+const MAGIC = MAGIC_V1; // retained for callers/tests referencing the original name
+const MAGIC_LEN = MAGIC_V2.length;
 const SALT_LEN = 16;
 const IV_LEN = 12;
 const TAG_LEN = 16;
@@ -52,6 +60,11 @@ const KEY_LEN = 32;
 const PBKDF2_ITERS = 200_000;
 const PBKDF2_DIGEST = "sha256";
 const CIPHER_ALGO = "aes-256-gcm";
+// Domain-separation label for the HKDF expand step (V2 key derivation).
+const HKDF_INFO_V2 = Buffer.from("dom-session-encryption-v2", "utf-8");
+// Label for the directory seal marker (HMAC over the token).
+const SEAL_LABEL = "dom-session-seal-v1";
+const MARKER_FILENAME = ".dom-enc-marker";
 
 /**
  * The SDK looks at CLAUDE_CONFIG_DIR. We default it to a project-local
@@ -84,35 +97,59 @@ function getSessionsRoot(): string {
 // Core crypto primitives
 // ---------------------------------------------------------------------------
 
-function deriveKey(salt: Buffer): Buffer {
+function getToken(): string {
   const token = process.env.AGENT_API_TOKEN;
   if (!token) {
     throw new Error("AGENT_API_TOKEN must be set to encrypt/decrypt session files");
   }
-  return pbkdf2Sync(token, salt, PBKDF2_ITERS, KEY_LEN, PBKDF2_DIGEST);
+  return token;
+}
+
+/** Legacy V1 key: PBKDF2 output used directly. */
+function deriveKeyV1(salt: Buffer): Buffer {
+  return pbkdf2Sync(getToken(), salt, PBKDF2_ITERS, KEY_LEN, PBKDF2_DIGEST);
+}
+
+/**
+ * V2 key: PBKDF2 stretch (unchanged 200k cost) THEN HKDF-Expand with a fixed
+ * domain label. The encryption key is therefore distinct from the raw token
+ * and from any other PBKDF2 use of it — leaking the bearer token no longer
+ * directly yields the at-rest key without also knowing this derivation.
+ */
+function deriveKeyV2(salt: Buffer): Buffer {
+  const prk = pbkdf2Sync(getToken(), salt, PBKDF2_ITERS, KEY_LEN, PBKDF2_DIGEST);
+  return Buffer.from(hkdfSync(PBKDF2_DIGEST, prk, salt, HKDF_INFO_V2, KEY_LEN));
 }
 
 export function isCiphertext(buf: Buffer): boolean {
-  return buf.length >= MAGIC_LEN && buf.subarray(0, MAGIC_LEN).equals(MAGIC);
+  if (buf.length < MAGIC_LEN) return false;
+  const head = buf.subarray(0, MAGIC_LEN);
+  return head.equals(MAGIC_V2) || head.equals(MAGIC_V1);
 }
 
-export function encryptBuffer(plaintext: Buffer): Buffer {
+function encryptWith(magic: Buffer, deriveKey: (s: Buffer) => Buffer, plaintext: Buffer): Buffer {
   const salt = randomBytes(SALT_LEN);
   const iv = randomBytes(IV_LEN);
   const key = deriveKey(salt);
   const cipher = createCipheriv(CIPHER_ALGO, key, iv);
   const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const tag = cipher.getAuthTag();
-  return Buffer.concat([MAGIC, salt, iv, tag, ciphertext]);
+  return Buffer.concat([magic, salt, iv, tag, ciphertext]);
+}
+
+export function encryptBuffer(plaintext: Buffer): Buffer {
+  return encryptWith(MAGIC_V2, deriveKeyV2, plaintext);
 }
 
 export function decryptBuffer(blob: Buffer): Buffer {
   if (!isCiphertext(blob)) {
-    throw new Error("Not an encrypted session file (missing DOMENC1 magic)");
+    throw new Error("Not an encrypted session file (missing DOMENC magic)");
   }
   if (blob.length < MAGIC_LEN + SALT_LEN + IV_LEN + TAG_LEN) {
     throw new Error("Encrypted session file is truncated");
   }
+  const isV2 = blob.subarray(0, MAGIC_LEN).equals(MAGIC_V2);
+  const deriveKey = isV2 ? deriveKeyV2 : deriveKeyV1;
   let off = MAGIC_LEN;
   const salt = blob.subarray(off, off + SALT_LEN); off += SALT_LEN;
   const iv = blob.subarray(off, off + IV_LEN); off += IV_LEN;
@@ -122,6 +159,57 @@ export function decryptBuffer(blob: Buffer): Buffer {
   const decipher = createDecipheriv(CIPHER_ALGO, key, iv);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+// ---------------------------------------------------------------------------
+// Seal marker + downgrade detection
+// ---------------------------------------------------------------------------
+//
+// When encryption is enabled we drop a tamper-evident marker (HMAC of a fixed
+// label under AGENT_API_TOKEN) in the config dir after a successful seal. If a
+// file under the sessions root is found PLAINTEXT while a valid marker exists,
+// that's a downgrade/tamper signal — an attacker swapped ciphertext for chosen
+// plaintext, or a crash left the tree unsealed. We refuse to silently ingest
+// it. (A full per-file signed manifest is the complete fix; this closes the
+// common silent-acceptance case.)
+
+function markerPath(): string {
+  return join(ensureClaudeConfigDir(), MARKER_FILENAME);
+}
+
+function expectedMarker(): string {
+  return createHmac("sha256", getToken()).update(SEAL_LABEL).digest("hex");
+}
+
+function writeSealMarker(): void {
+  try {
+    writeFileSync(markerPath(), expectedMarker(), { mode: 0o600 });
+  } catch { /* best-effort */ }
+}
+
+function sealMarkerValid(): boolean {
+  try {
+    const p = markerPath();
+    return existsSync(p) && readFileSync(p, "utf-8") === expectedMarker();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * One-time migration escape hatch. Enabling encryption on a directory that
+ * already holds PLAINTEXT sessions is the ONLY legitimate reason to accept
+ * plaintext at rest. It must be opted into explicitly; otherwise plaintext is
+ * always treated as a downgrade. This makes the check independent of the
+ * (attacker-deletable) seal marker — deleting the marker no longer re-opens
+ * silent plaintext acceptance.
+ */
+function isMigrationMode(): boolean {
+  return process.env.AGENT_SESSION_ENCRYPT_MIGRATE === "true";
+}
+
+function isPlaintextDowngrade(buf: Buffer): boolean {
+  return isEncryptionEnabled() && !isMigrationMode() && !isCiphertext(buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +284,7 @@ export function encryptSessionsNow(): { encrypted: number; skipped: number; erro
 
   let encrypted = 0, skipped = 0, errors = 0;
   for (const file of listRegularFiles(root)) {
+    if (file === markerPath()) { skipped++; continue; }
     try {
       const raw = readFileSync(file);
       if (isCiphertext(raw)) { skipped++; continue; }
@@ -205,6 +294,9 @@ export function encryptSessionsNow(): { encrypted: number; skipped: number; erro
       errors++;
     }
   }
+  // Drop the seal marker once everything is encrypted, so a later plaintext
+  // file under a valid marker reads as tampering (see isPlaintextDowngrade).
+  if (errors === 0) writeSealMarker();
   return { encrypted, skipped, errors };
 }
 
@@ -219,9 +311,25 @@ export function decryptSessionsNow(): { decrypted: number; skipped: number; erro
 
   let decrypted = 0, skipped = 0, errors = 0;
   for (const file of listRegularFiles(root)) {
+    if (file === markerPath()) { skipped++; continue; }
     try {
       const raw = readFileSync(file);
-      if (!isCiphertext(raw)) { skipped++; continue; }
+      if (!isCiphertext(raw)) {
+        // Plaintext at rest while encryption is enabled = downgrade/tamper (or
+        // a crash left it unsealed). Surface loudly instead of silently passing
+        // — UNLESS this is an explicit one-time migration.
+        if (isMigrationMode()) {
+          skipped++; // will be sealed on the next encrypt sweep
+        } else {
+          console.error(
+            `[session-crypt] SECURITY: plaintext session file with encryption enabled: ${file}. ` +
+            `Possible tampering/downgrade, or a prior run crashed before re-sealing. ` +
+            `If you are intentionally migrating a plaintext directory, set AGENT_SESSION_ENCRYPT_MIGRATE=true once.`,
+          );
+          errors++;
+        }
+        continue;
+      }
       atomicWrite(file, decryptBuffer(raw));
       decrypted++;
     } catch {
@@ -232,21 +340,69 @@ export function decryptSessionsNow(): { decrypted: number; skipped: number; erro
 }
 
 /**
- * Read a session file, transparently decrypting if it's DOMENC1-prefixed.
+ * Read a session file, transparently decrypting if it's DOMENC-prefixed.
  * Returns the plaintext content as a Buffer. Does NOT rewrite the file.
+ * Throws if the file is plaintext while the directory is sealed (downgrade).
  */
 export function readSessionFile(path: string): Buffer {
   const raw = readFileSync(path);
+  if (isPlaintextDowngrade(raw)) {
+    throw new Error(
+      `Refusing to read plaintext session file '${path}' under a valid encryption seal — ` +
+      `possible tampering or downgrade attack.`,
+    );
+  }
   return isCiphertext(raw) ? decryptBuffer(raw) : raw;
+}
+
+// ---------------------------------------------------------------------------
+// Active-run reference counting — defers re-encryption until the LAST
+// concurrent run/listing finishes, so one run's finally-block can't re-encrypt
+// the tree while another run is still reading plaintext. (Node is single-
+// threaded, so the counter mutations at these sync points don't interleave.)
+// ---------------------------------------------------------------------------
+
+let activeRuns = 0;
+
+/** Enter the decrypted bracket: decrypt on the first concurrent entrant. */
+export function beginActiveRun(): void {
+  if (!isEncryptionEnabled()) return;
+  if (activeRuns === 0) decryptSessionsNow();
+  activeRuns++;
+}
+
+/** Leave the bracket: re-encrypt (and surface failures) when the last one exits. */
+export function endActiveRun(): void {
+  if (!isEncryptionEnabled()) return;
+  activeRuns = Math.max(0, activeRuns - 1);
+  if (activeRuns === 0) {
+    const r = encryptSessionsNow();
+    if (r.errors > 0) {
+      console.error(
+        `[session-crypt] SECURITY: re-encryption reported ${r.errors} error(s) — ` +
+        `some session files may remain plaintext on disk.`,
+      );
+    }
+  }
 }
 
 // Exposed for tests
 export const _internal = {
   MAGIC,
+  MAGIC_V1,
+  MAGIC_V2,
   MAGIC_LEN,
   SALT_LEN,
   IV_LEN,
   TAG_LEN,
   KEY_LEN,
   getSessionsRoot,
+  writeSealMarker,
+  sealMarkerValid,
+  isPlaintextDowngrade,
+  beginActiveRun,
+  endActiveRun,
+  resetActiveRunsForTests: () => { activeRuns = 0; },
+  /** Build a legacy V1 ciphertext (for backward-compat tests). */
+  encryptLegacyV1: (plaintext: Buffer): Buffer => encryptWith(MAGIC_V1, deriveKeyV1, plaintext),
 };

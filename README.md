@@ -75,12 +75,12 @@ Most coding agents will happily embed secrets in source files, run destructive c
 
 | Feature | What it does |
 |---|---|
-| **Docker sandbox** | The agent runs inside a container with `--cap-drop ALL`, `no-new-privileges`, memory/CPU limits, and a dedicated bridge network. |
+| **Docker sandbox** | The agent runs **non-root (as the host UID)** inside a container with `--cap-drop ALL` (only `CHOWN`/`FOWNER` re-added — no `SETUID`/`SETGID`/`DAC_OVERRIDE`), `no-new-privileges`, `--pids-limit`, memory/CPU limits, and a dedicated bridge network. |
 | **Guardrails (3 SDK hooks)** | `PreToolUse` blocks destructive Bash, non-allowlisted network hosts (incl. WebFetch), and Write/Edit content matching known secret patterns. `PostToolUse` tracks state. `Stop` refuses to finish without review. |
 | **Goal persistence** | The user's original prompt is written to `.dom-goal` in the workspace. The main agent reads it first; the `goal-verifier` subagent reads it last to confirm the build actually satisfies the request. |
 | **Five mandatory subagents** | `code-reviewer`, `tester`, `eval`, `goal-verifier`, `brain-curator` — all Haiku, all triggered by the Stop hook when files change or WebFetch runs. Dom literally cannot return a result without these passing. |
 | **Shared brain** | A curated markdown memory bank (`./.dom-brain/`). Newest entries are loaded into every system prompt. The `brain-curator` decides what to save, overwrites contradicted memories, and tombstones dormant ones. Human-readable, `cat`-friendly, `git`-versionable. |
-| **Three-layer network defense** | Bash-level command allowlist → isolated Docker bridge → opt-in HAProxy SNI egress proxy. Each layer catches what the others miss. |
+| **Network defense (layered, with caveats)** | Bash-level command host allowlist (checks **every** host in a chained command) → isolated Docker bridge. **Default mode has full internet egress** — the bridge isolates containers from each other, it does *not* filter outbound to the internet, and the Bash regex is best-effort (raw sockets/`/dev/tcp`/DNS bypass it). An **opt-in** HAProxy SNI egress proxy (`AGENT_EGRESS_PROXY` + `docker-compose.egress.yml`) is the intended hard boundary, but its config is currently **unverified** — see CLAUDE.md § "Network Security". |
 | **Audit log** | JSON-lines log of every tool call (`./logs/audit.log`, 10 MB rotation, Bash command secrets redacted before write). |
 | **Cost budget** | `AGENT_MAX_COST_USD` caps per-session spend. New runs on a budget-exceeded session are refused with `402`. |
 | **HTTP API** | Bearer-auth, per-IP rate-limited, SSE streaming. Designed for a Telegram bot front-end but works with any HTTP client. |
@@ -219,6 +219,8 @@ Tests cover: every destructive-command regex, the WebFetch allowlist, Write/Edit
 ## Security
 
 - Docker isolation is the **primary** security boundary. The regex guardrails are defense-in-depth, not a replacement.
+- **Default mode has full internet egress.** The Docker bridge does not filter outbound traffic; the Bash host-allowlist is best-effort (bypassable via raw sockets, `/dev/tcp`, DNS). For an egress allowlist, enable the opt-in proxy — and verify it (its HAProxy config ships unverified).
+- **Run the host smoke tests for the non-root container (H3) and the egress proxy (H1) before your first deploy.** Both are code-complete but have not been verified against a live container; confirm bind-mount writes work as the host UID and that the egress proxy actually enforces its allowlist.
 - Run with `AGENT_SANDBOX=true` in production. Always.
 - The HTTP API requires `AGENT_API_TOKEN` (timing-safe compared). The server **refuses to start** if unset.
 - See `CLAUDE.md` § "Security Notes" and § "Network Security" for the full threat model.

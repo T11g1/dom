@@ -147,12 +147,22 @@ export async function* runInSandbox(
   // should be visible inside the container go here too.
   const tmpDir = mkdtempSync(join(tmpdir(), "dom-env-"));
   const envFilePath = join(tmpDir, "agent.env");
+  // Optional egress proxy. When AGENT_EGRESS_PROXY is set (e.g. to
+  // http://dom-egress-proxy:8443 from docker-compose.egress.yml), point the
+  // container's HTTP(S)_PROXY at it so well-behaved HTTP libraries route
+  // through the SNI allowlist. NOTE: this only constrains proxy-aware clients —
+  // raw sockets / DNS still bypass it. See "Network Security" in CLAUDE.md.
+  const egressProxy = process.env.AGENT_EGRESS_PROXY;
   writeFileSync(
     envFilePath,
     `ANTHROPIC_API_KEY=${process.env.ANTHROPIC_API_KEY ?? ""}\n` +
     `AGENT_BRAIN_DIR=${CONTAINER_BRAIN_PATH}\n` +
     (process.env.AGENT_BRAIN_MAX_LOADED ? `AGENT_BRAIN_MAX_LOADED=${process.env.AGENT_BRAIN_MAX_LOADED}\n` : "") +
-    (process.env.AGENT_BRAIN_MAX_ENTRIES ? `AGENT_BRAIN_MAX_ENTRIES=${process.env.AGENT_BRAIN_MAX_ENTRIES}\n` : ""),
+    (process.env.AGENT_BRAIN_MAX_ENTRIES ? `AGENT_BRAIN_MAX_ENTRIES=${process.env.AGENT_BRAIN_MAX_ENTRIES}\n` : "") +
+    (egressProxy
+      ? `HTTPS_PROXY=${egressProxy}\nHTTP_PROXY=${egressProxy}\n` +
+        `NO_PROXY=localhost,127.0.0.1\n`
+      : ""),
     { mode: 0o600 },
   );
 
@@ -160,6 +170,15 @@ export async function* runInSandbox(
     try { unlinkSync(envFilePath); } catch { /* already gone */ }
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
   };
+
+  // Run as the host user (not root). With --user = host uid:gid, writes to the
+  // bind-mounted /workspace and /brain "just work" (the process IS the owner),
+  // and we no longer need root + DAC_OVERRIDE/SET[UG]ID to cross the mount.
+  // getuid/getgid are POSIX-only; fall back to image default elsewhere.
+  const userArgs =
+    typeof process.getuid === "function" && typeof process.getgid === "function"
+      ? ["--user", `${process.getuid()}:${process.getgid()}`]
+      : [];
 
   const container = spawn("docker", [
     "run",
@@ -170,19 +189,22 @@ export async function* runInSandbox(
     "-v", `${hostBrainDir}:${CONTAINER_BRAIN_PATH}`,
     // Pass API key via env file (not visible in `ps aux`)
     "--env-file", envFilePath,
+    // Run non-root as the host user (see above)
+    ...userArgs,
     // Resource limits
     "--memory", "2g",
     "--cpus", "2",
-    // Security
+    "--pids-limit", "512",
+    // Security — drop ALL caps and re-add only the file-ownership caps package
+    // managers may need. The privilege-escalation caps SETUID/SETGID and the
+    // permission-bypass cap DAC_OVERRIDE are deliberately NOT granted.
     "--security-opt", "no-new-privileges",
     "--cap-drop", "ALL",
     "--cap-add", "CHOWN",
-    "--cap-add", "DAC_OVERRIDE",
     "--cap-add", "FOWNER",
-    "--cap-add", "SETUID",
-    "--cap-add", "SETGID",
-    // Restricted bridge network — provides container isolation.
-    // For real egress filtering, run docker-compose.egress.yml (HAProxy proxy).
+    // Restricted bridge network — provides container isolation, NOT egress
+    // filtering. Default mode has full internet egress; for SNI-allowlisted
+    // egress run docker-compose.egress.yml and set AGENT_EGRESS_PROXY.
     "--network", network,
     DOCKER_IMAGE,
     requestJson,

@@ -3,6 +3,7 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import { createServer as createHttpsServer } from "https";
 import { readFileSync } from "fs";
 import { timingSafeEqual } from "crypto";
+import { pathToFileURL } from "url";
 import { createAgent, BudgetExceededError, isSandboxEnabled, type AgentEvent } from "./agent.js";
 import { listSessions, getSession } from "./sessions.js";
 import { parseModelFromPrompt } from "./models.js";
@@ -14,30 +15,18 @@ const PORT = Number(process.env.AGENT_WEB_PORT) || 3333;
 const CORS_ORIGIN = process.env.AGENT_CORS_ORIGIN || "http://localhost:3333";
 const RATE_LIMIT = Number(process.env.AGENT_RATE_LIMIT) || 10;
 const RATE_WINDOW_MS = 60_000;
-
-// Refuse to start without an auth token configured
-const AGENT_API_TOKEN = process.env.AGENT_API_TOKEN;
-if (!AGENT_API_TOKEN) {
-  console.error("Error: AGENT_API_TOKEN must be set. Generate one with: openssl rand -hex 32");
-  process.exit(1);
-}
-
-// ---------------------------------------------------------------------------
-// TLS — both cert+key must be set, or neither. Enforced before we start.
-// ---------------------------------------------------------------------------
+// Hard cap on a single request body. The prompt cap is 100k chars; this bounds
+// the raw bytes we'll buffer before parsing, so a huge POST can't OOM us.
+const MAX_BODY_BYTES = Number(process.env.AGENT_MAX_BODY_BYTES) || 1_000_000;
+// Bound the rate-limit map so a source-rotating (e.g. IPv6) flood can't grow
+// it without limit. Oldest entries are evicted when the cap is reached.
+let MAX_RATE_BUCKETS = Number(process.env.AGENT_RATE_LIMIT_MAX_IPS) || 10_000;
+// Only trust X-Forwarded-For when explicitly behind a known reverse proxy.
+// Default: use the raw socket address (XFF is client-spoofable otherwise).
+let TRUST_PROXY = process.env.AGENT_TRUST_PROXY === "true";
 
 const TLS_CERT = process.env.AGENT_TLS_CERT;
 const TLS_KEY = process.env.AGENT_TLS_KEY;
-
-if (Boolean(TLS_CERT) !== Boolean(TLS_KEY)) {
-  console.error(
-    "Error: AGENT_TLS_CERT and AGENT_TLS_KEY must both be set, or neither. " +
-    "To generate a self-signed dev cert: " +
-    "openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes",
-  );
-  process.exit(1);
-}
-
 const TLS_ENABLED = Boolean(TLS_CERT && TLS_KEY);
 
 // ---------------------------------------------------------------------------
@@ -49,8 +38,12 @@ function isAuthorized(req: IncomingMessage): boolean {
   if (typeof header !== "string" || !header.startsWith("Bearer ")) return false;
   const provided = header.slice("Bearer ".length).trim();
 
+  // Read the token at call time so the module is import-safe (no top-level
+  // exit) and testable. The server refuses to START without it (see startServer).
+  const expected = process.env.AGENT_API_TOKEN;
+  if (!expected) return false;
+
   // Lengths must match before timingSafeEqual; comparing buffers of unequal length throws
-  const expected = AGENT_API_TOKEN!;
   if (provided.length !== expected.length) return false;
 
   try {
@@ -67,6 +60,15 @@ function isAuthorized(req: IncomingMessage): boolean {
 const rateBuckets = new Map<string, number[]>();
 
 function clientIp(req: IncomingMessage): string {
+  if (TRUST_PROXY) {
+    const xff = req.headers["x-forwarded-for"];
+    if (typeof xff === "string" && xff.trim()) {
+      // With a single trusted reverse proxy, the RIGHTMOST entry is the address
+      // our proxy actually observed (leftmost entries are client-spoofable).
+      const parts = xff.split(",").map((s) => s.trim()).filter(Boolean);
+      if (parts.length) return parts[parts.length - 1];
+    }
+  }
   return req.socket.remoteAddress ?? "unknown";
 }
 
@@ -80,6 +82,16 @@ function checkRateLimit(ip: string): number | null {
 
   let bucket = rateBuckets.get(ip);
   if (!bucket) {
+    // Bound the map: evict the oldest ~10% when at capacity so a flood from
+    // many distinct source addresses can't grow it without limit.
+    if (rateBuckets.size >= MAX_RATE_BUCKETS) {
+      const evict = Math.max(1, Math.floor(MAX_RATE_BUCKETS * 0.1));
+      let n = 0;
+      for (const k of rateBuckets.keys()) {
+        rateBuckets.delete(k);
+        if (++n >= evict) break;
+      }
+    }
     bucket = [];
     rateBuckets.set(ip, bucket);
   }
@@ -122,10 +134,29 @@ function sendJson(res: ServerResponse, status: number, data: unknown) {
   res.end(JSON.stringify(data));
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
+class BodyTooLargeError extends Error {
+  readonly code = "BODY_TOO_LARGE";
+  constructor() {
+    super("Request body too large");
+    this.name = "BodyTooLargeError";
+  }
+}
+
+function readBody(req: IncomingMessage, maxBytes: number = MAX_BODY_BYTES): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (c) => chunks.push(c));
+    let total = 0;
+    req.on("data", (c: Buffer) => {
+      total += c.length;
+      if (total > maxBytes) {
+        // Stop buffering immediately and tear down the connection so a
+        // multi-gigabyte POST can't exhaust memory.
+        reject(new BodyTooLargeError());
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
     req.on("end", () => resolve(Buffer.concat(chunks).toString()));
     req.on("error", reject);
   });
@@ -142,6 +173,12 @@ function sendSseEvent(res: ServerResponse, event: string, data: unknown) {
 const MAX_PROMPT_LEN = 100_000;
 const MAX_SESSION_ID_LEN = 128;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9-]+$/;
+
+/** A session id is safe iff it matches the charset and length bounds. Used by
+ *  both POST /agent validation and the GET /sessions/:id route guard. */
+function isValidSessionId(id: string): boolean {
+  return typeof id === "string" && id.length > 0 && id.length <= MAX_SESSION_ID_LEN && SESSION_ID_PATTERN.test(id);
+}
 
 interface SanitizedAgentRequest {
   prompt: string;
@@ -245,7 +282,17 @@ function sanitizeAgentRequest(
 // ---------------------------------------------------------------------------
 
 async function handleAgent(req: IncomingMessage, res: ServerResponse) {
-  const body = await readBody(req);
+  let body: string;
+  try {
+    body = await readBody(req);
+  } catch (err) {
+    if (err instanceof BodyTooLargeError) {
+      sendJson(res, 413, { error: `Request body exceeds ${MAX_BODY_BYTES} bytes` });
+    } else {
+      sendJson(res, 400, { error: "Could not read request body" });
+    }
+    return;
+  }
 
   let parsed: unknown;
   try {
@@ -352,9 +399,11 @@ async function handleAgent(req: IncomingMessage, res: ServerResponse) {
       }
     }
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    // Log the detail server-side; never reflect raw err.message (host paths,
+    // internal IDs, dependency internals) to the client.
+    console.error("[agent] run error:", err);
     sendSseEvent(res, "error", {
-      message,
+      message: err instanceof BudgetExceededError ? err.message : "Internal error during agent run",
       ...(err instanceof BudgetExceededError ? { kind: "budget_exceeded", budgetUsd: err.budgetUsd } : {}),
     });
   }
@@ -372,7 +421,8 @@ async function handleListSessions(_req: IncomingMessage, res: ServerResponse) {
     const sessions = await listSessions();
     sendJson(res, 200, { sessions });
   } catch (err) {
-    sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+    console.error("[sessions] list error:", err);
+    sendJson(res, 500, { error: "Internal error" });
   }
 }
 
@@ -389,7 +439,8 @@ async function handleGetSession(sessionId: string, res: ServerResponse) {
     }
     sendJson(res, 200, { session });
   } catch (err) {
-    sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+    console.error("[sessions] get error:", err);
+    sendJson(res, 500, { error: "Internal error" });
   }
 }
 
@@ -442,10 +493,17 @@ const requestHandler = async (req: IncomingMessage, res: ServerResponse) => {
     return;
   }
 
-  // GET /sessions/:id
+  // GET /sessions/:id — validate the path param with the SAME rules as the
+  // POST body. url.pathname is percent-decoded, so an un-validated `.+` would
+  // let `..%2f..%2fetc` reach the filesystem-backed SDK lookup.
   const sessionMatch = url.pathname.match(/^\/sessions\/(.+)$/);
   if (req.method === "GET" && sessionMatch) {
-    await handleGetSession(sessionMatch[1], res);
+    const id = sessionMatch[1];
+    if (!isValidSessionId(id)) {
+      sendJson(res, 400, { error: "Invalid session id" });
+      return;
+    }
+    await handleGetSession(id, res);
     return;
   }
 
@@ -453,29 +511,86 @@ const requestHandler = async (req: IncomingMessage, res: ServerResponse) => {
   sendJson(res, 404, { error: "Not found" });
 };
 
-// Create HTTP or HTTPS server based on env. If cert/key files can't be read,
-// fail fast with the underlying fs error — better than a confused TLS handshake later.
-const server = TLS_ENABLED
-  ? createHttpsServer(
-      {
-        cert: readFileSync(TLS_CERT!),
-        key: readFileSync(TLS_KEY!),
-      },
-      requestHandler,
-    )
-  : createHttpServer(requestHandler);
+// Bootstrap is wrapped in startServer() and only invoked when this module is
+// run directly — so importing it (e.g. from tests) doesn't exit the process,
+// validate TLS, or bind a port.
+/**
+ * Validate required startup config. Throws (does not exit) so it's unit-testable;
+ * startServer() turns a throw into a logged process.exit(1).
+ *  - AGENT_API_TOKEN must be set (no auth = no server).
+ *  - TLS cert+key must be both-set or both-unset (fail closed — never half-TLS).
+ */
+export function assertStartupConfig(opts?: { apiToken?: string; tlsCert?: string; tlsKey?: string }): void {
+  const apiToken = opts && "apiToken" in opts ? opts.apiToken : process.env.AGENT_API_TOKEN;
+  const tlsCert = opts && "tlsCert" in opts ? opts.tlsCert : TLS_CERT;
+  const tlsKey = opts && "tlsKey" in opts ? opts.tlsKey : TLS_KEY;
 
-server.listen(PORT, () => {
-  console.log(`\nDom server on ${SCHEME}://localhost:${PORT}\n`);
-  console.log("  POST /agent          { prompt, sessionId?, outputDir? } → SSE stream  [auth]");
-  console.log("  GET  /sessions       List recent sessions  [auth]");
-  console.log("  GET  /sessions/:id   Get session details  [auth]");
-  console.log("  GET  /health         Health check  (public)");
-  console.log("\n  Auth:        Authorization: Bearer <AGENT_API_TOKEN>");
-  console.log(`  CORS origin: ${CORS_ORIGIN}`);
-  console.log(`  Rate limit:  ${RATE_LIMIT} requests/minute per IP on POST /agent`);
-  console.log(`  TLS:         ${TLS_ENABLED ? "enabled" : "disabled (HTTP)"}\n`);
-  if (CORS_ORIGIN === "*") {
-    console.warn("  Warning: CORS is set to allow all origins. Restrict this in production.\n");
+  if (!apiToken) {
+    throw new Error("AGENT_API_TOKEN must be set. Generate one with: openssl rand -hex 32");
   }
-});
+  if (Boolean(tlsCert) !== Boolean(tlsKey)) {
+    throw new Error(
+      "AGENT_TLS_CERT and AGENT_TLS_KEY must both be set, or neither. " +
+      "To generate a self-signed dev cert: " +
+      "openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes",
+    );
+  }
+}
+
+export function startServer() {
+  try {
+    assertStartupConfig();
+  } catch (err) {
+    console.error("Error:", err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+
+  const server = TLS_ENABLED
+    ? createHttpsServer(
+        { cert: readFileSync(TLS_CERT!), key: readFileSync(TLS_KEY!) },
+        requestHandler,
+      )
+    : createHttpServer(requestHandler);
+
+  server.listen(PORT, () => {
+    console.log(`\nDom server on ${SCHEME}://localhost:${PORT}\n`);
+    console.log("  POST /agent          { prompt, sessionId?, outputDir? } → SSE stream  [auth]");
+    console.log("  GET  /sessions       List recent sessions  [auth]");
+    console.log("  GET  /sessions/:id   Get session details  [auth]");
+    console.log("  GET  /health         Health check  (public)");
+    console.log("\n  Auth:        Authorization: Bearer <AGENT_API_TOKEN>");
+    console.log(`  CORS origin: ${CORS_ORIGIN}`);
+    console.log(`  Rate limit:  ${RATE_LIMIT} requests/minute per ${TRUST_PROXY ? "client (via X-Forwarded-For)" : "IP"} on POST /agent`);
+    console.log(`  TLS:         ${TLS_ENABLED ? "enabled" : "disabled (HTTP)"}\n`);
+    if (CORS_ORIGIN === "*") {
+      console.warn("  Warning: CORS is set to allow all origins. Restrict this in production.\n");
+    }
+  });
+
+  return server;
+}
+
+// Only auto-start when executed directly (node dist/server.js / tsx src/server.ts).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  startServer();
+}
+
+// ---------------------------------------------------------------------------
+// Exports for tests (the module is import-safe; nothing above binds a port).
+// ---------------------------------------------------------------------------
+
+export {
+  sanitizeAgentRequest,
+  isValidSessionId,
+  isAuthorized,
+  clientIp,
+  checkRateLimit,
+  readBody,
+  BodyTooLargeError,
+};
+
+export const _internal = {
+  rateBuckets,
+  setMaxRateBucketsForTests: (n: number) => { MAX_RATE_BUCKETS = n; },
+  setTrustProxyForTests: (b: boolean) => { TRUST_PROXY = b; },
+};
