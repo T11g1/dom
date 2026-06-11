@@ -220,6 +220,7 @@ Tests cover: every destructive-command regex, the WebFetch allowlist, Write/Edit
 
 - Docker isolation is the **primary** security boundary. The regex guardrails are defense-in-depth, not a replacement.
 - **Default mode has full internet egress.** The Docker bridge does not filter outbound traffic; the Bash host-allowlist is best-effort (bypassable via raw sockets, `/dev/tcp`, DNS). For an egress allowlist, enable the opt-in proxy — and verify it (its HAProxy config ships unverified).
+- **Run the host smoke tests for the non-root container (H3) and the egress proxy (H1) before your first deploy.** Both are code-complete but have not been verified against a live container; confirm bind-mount writes work as the host UID and that the egress proxy actually enforces its allowlist.
 - Run with `AGENT_SANDBOX=true` in production. Always.
 - The HTTP API requires `AGENT_API_TOKEN` (timing-safe compared). The server **refuses to start** if unset.
 - See `CLAUDE.md` § "Security Notes" and § "Network Security" for the full threat model.
