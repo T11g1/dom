@@ -209,7 +209,7 @@ Honesty matters more than feature-checklists:
 
 ```bash
 npm run typecheck        # tsc --noEmit
-npm test                 # 82 specs, ~300ms
+npm test                 # 134 specs
 ```
 
 Tests cover: every destructive-command regex, the WebFetch allowlist, Write/Edit leak detection, agent-id gating, session-state isolation, brain parsing + load-time leak defense + path traversal, audit redaction, encryption round-trip, budget enforcement, goal persistence.

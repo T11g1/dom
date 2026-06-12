@@ -194,7 +194,13 @@ function extractAllHosts(command: string): string[] {
 
   for (const m of command.matchAll(/https?:\/\/([^\/\s:"'`]+)/gi)) add(m[1]);
   for (const m of command.matchAll(/(?:TCP[46]?|UDP[46]?|OPENSSL|SSL):([^:\s,"'`]+):/gi)) add(m[1]);
-  for (const m of command.matchAll(/\b(?:ssh|scp|rsync)\s+(?:-[^\s]+\s+)*(?:[^\s@]+@)?([a-zA-Z0-9][a-zA-Z0-9.-]*)/g)) add(m[1]);
+  // ssh/scp/rsync/git targets: user@host and host:path forms. We deliberately
+  // do NOT positionally grab "the first token after ssh" — that mis-reads a
+  // flag value (`-i key`) or a local filename (`scp ./file user@host:`) as the
+  // host. Require a dotted hostname to limit false matches; anything that
+  // resolves to no host (e.g. bare `ssh internalhost`) fails closed at the call site.
+  for (const m of command.matchAll(/@([a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,})/g)) add(m[1]);
+  for (const m of command.matchAll(/(?:^|\s)([a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}):/g)) add(m[1]);
   for (const m of command.matchAll(/\b(?:nc|ncat|netcat)\s+(?:-[^\s]+\s+)*([a-zA-Z0-9][a-zA-Z0-9.-]*)\s+\d+/g)) add(m[1]);
 
   // Bare curl/wget targets (no scheme). Only count tokens that look like a

@@ -5,10 +5,17 @@ artwork ("Dom image.png"): the retrowave scene is the background, the baked-in
 wordmark replaces it, and a color-coded capability mindmap is overlaid BEHIND
 the wordmark (branch lines run behind the letters).
 """
+import os
+import sys
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-REF = "/Users/rainer.tiigi/Desktop/Claude/Dom image.png"
-OUT = ".github/social-card.png"
+# Reference artwork + output path are configurable — no hardcoded local path.
+#   make-social-card.py <reference-image.png> [out.png]
+# or set DOM_SOCIAL_REF / DOM_SOCIAL_OUT.
+REF = os.environ.get("DOM_SOCIAL_REF") or (sys.argv[1] if len(sys.argv) > 1 else "")
+OUT = os.environ.get("DOM_SOCIAL_OUT") or (sys.argv[2] if len(sys.argv) > 2 else ".github/social-card.png")
+if not REF:
+    sys.exit("usage: make-social-card.py <reference-image.png> [out.png]  (or set DOM_SOCIAL_REF)")
 
 W, H = 1280, 640
 S = 2  # supersample factor

@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "http";
 import { createServer as createHttpsServer } from "https";
-import { readFileSync } from "fs";
+import { readFileSync, realpathSync } from "fs";
 import { timingSafeEqual } from "crypto";
 import { pathToFileURL } from "url";
 import { createAgent, BudgetExceededError, isSandboxEnabled, type AgentEvent } from "./agent.js";
@@ -81,9 +81,17 @@ function checkRateLimit(ip: string): number | null {
   const cutoff = now - RATE_WINDOW_MS;
 
   let bucket = rateBuckets.get(ip);
-  if (!bucket) {
-    // Bound the map: evict the oldest ~10% when at capacity so a flood from
-    // many distinct source addresses can't grow it without limit.
+  if (bucket) {
+    // Touch: re-insert so this key becomes most-recent. Map iteration is
+    // insertion order, so eviction from the front (below) then drops the
+    // least-recently-ACTIVE bucket — true LRU, not FIFO. Without this, a flood
+    // of new source IPs could evict an actively-limited client's bucket and
+    // reset its count to zero (a rate-limit bypass).
+    rateBuckets.delete(ip);
+    rateBuckets.set(ip, bucket);
+  } else {
+    // Bound the map: evict the least-recently-active ~10% at capacity so a
+    // flood from many distinct source addresses can't grow it without limit.
     if (rateBuckets.size >= MAX_RATE_BUCKETS) {
       const evict = Math.max(1, Math.floor(MAX_RATE_BUCKETS * 0.1));
       let n = 0;
@@ -571,7 +579,19 @@ export function startServer() {
 }
 
 // Only auto-start when executed directly (node dist/server.js / tsx src/server.ts).
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Compare realpaths: under tsx, import.meta.url is realpath-resolved while
+// process.argv[1] may be a symlink (e.g. a project under /tmp), so a raw compare
+// would silently fail to start the server.
+function isMainModule(): boolean {
+  const invoked = process.argv[1];
+  if (!invoked) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(invoked)).href;
+  } catch {
+    return import.meta.url === pathToFileURL(invoked).href;
+  }
+}
+if (isMainModule()) {
   startServer();
 }
 
