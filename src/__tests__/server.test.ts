@@ -121,6 +121,33 @@ describe("server — rate limiter (security-hardening)", () => {
       _internal.setMaxRateBucketsForTests(10_000);
     }
   });
+
+  it("touches the bucket on access so eviction is LRU, not FIFO", () => {
+    _internal.rateBuckets.clear();
+    checkRateLimit("a"); checkRateLimit("b"); checkRateLimit("c");
+    checkRateLimit("a"); // re-access 'a' → should become most-recent
+    const order = [..._internal.rateBuckets.keys()];
+    assert.equal(order[order.length - 1], "a", "most-recently-accessed key must be last (LRU)");
+  });
+
+  it("does not reset an actively-limited client during a source-rotating flood", () => {
+    _internal.rateBuckets.clear();
+    _internal.setMaxRateBucketsForTests(8);
+    try {
+      const limit = Number(process.env.AGENT_RATE_LIMIT) || 10;
+      for (let i = 0; i < limit; i++) checkRateLimit("victim");
+      assert.equal(typeof checkRateLimit("victim"), "number", "victim should be limited");
+      // Flood with many distinct IPs; victim keeps sending (stays active).
+      // With FIFO eviction the victim's early bucket would be dropped and reset.
+      for (let i = 0; i < 60; i++) {
+        checkRateLimit(`flood-${i}`);
+        assert.equal(typeof checkRateLimit("victim"), "number", "victim must stay limited (not evicted/reset)");
+      }
+    } finally {
+      _internal.setMaxRateBucketsForTests(10_000);
+      _internal.rateBuckets.clear();
+    }
+  });
 });
 
 describe("server — client IP source (security-hardening)", () => {

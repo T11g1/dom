@@ -303,6 +303,8 @@ Sessions may contain sensitive prompts and generated code. When `AGENT_SESSION_E
 
 **Concurrent runs (reference counting):** the decrypt→run→re-encrypt bracket is reference-counted (`beginActiveRun`/`endActiveRun`). The tree is decrypted on the first concurrent entrant and only re-encrypted when the **last** run/listing exits, so one run's `finally` can't re-seal files another run is still reading. Re-encryption errors are surfaced (logged), not swallowed.
 
+**Local-mode only:** the bracket applies to the host's `./.dom-claude/` in local mode (and around `listSessions`/`getSession`). In Docker mode the SDK writes sessions *inside* the container and `.dom-claude/` is not mounted in, so at-rest session encryption does not apply there — rely on Docker volume / OS-level encryption for the container's storage.
+
 **Graceful fallback:** existing unencrypted session files are still readable when no seal marker exists yet — the decrypt path checks the magic header and passes plaintext through. You can enable encryption on a directory that already has plaintext sessions; they get sealed (and the marker written) on the next run. Once sealed, the downgrade detection above applies.
 
 **Session location:** Dom sets `CLAUDE_CONFIG_DIR=./.dom-claude` by default so sessions are stored inside the project, not in `~/.claude/`. This keeps encryption sweeps bounded to the project folder. `.dom-claude/` is in `.gitignore`.
